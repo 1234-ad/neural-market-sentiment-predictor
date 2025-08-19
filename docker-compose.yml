@@ -1,0 +1,410 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: neural_predictor_db
+    environment:
+      POSTGRES_DB: neural_predictor
+      POSTGRES_USER: predictor_user
+      POSTGRES_PASSWORD: predictor_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - predictor_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U predictor_user -d neural_predictor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: neural_predictor_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - predictor_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Kafka for real-time data streaming
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: neural_predictor_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - predictor_network
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: neural_predictor_kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - predictor_network
+
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: neural_predictor_api
+    environment:
+      - DATABASE_URL=postgresql://predictor_user:predictor_password@postgres:5432/neural_predictor
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYTHONPATH=/app
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+      - model_cache:/app/model_cache
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    networks:
+      - predictor_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Streamlit Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: neural_predictor_dashboard
+    environment:
+      - API_BASE_URL=http://api:8000
+      - PYTHONPATH=/app
+    volumes:
+      - ./dashboard:/app/dashboard
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Data Collector Service
+  data_collector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.collector
+    container_name: neural_predictor_collector
+    environment:
+      - DATABASE_URL=postgresql://predictor_user:predictor_password@postgres:5432/neural_predictor
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+      - collector_data:/app/collector_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Celery Worker for Background Tasks
+  celery_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: neural_predictor_worker
+    command: celery -A app.celery_app worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://predictor_user:predictor_password@postgres:5432/neural_predictor
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYTHONPATH=/app
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+      - model_cache:/app/model_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Celery Beat for Scheduled Tasks
+  celery_beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: neural_predictor_scheduler
+    command: celery -A app.celery_app beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://predictor_user:predictor_password@postgres:5432/neural_predictor
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYTHONPATH=/app
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.9-slim
+    container_name: neural_predictor_mlflow
+    command: >
+      bash -c "pip install mlflow psycopg2-binary &&
+               mlflow server --host 0.0.0.0 --port 5000 
+               --backend-store-uri postgresql://predictor_user:predictor_password@postgres:5432/neural_predictor
+               --default-artifact-root /mlflow/artifacts"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Prometheus for Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: neural_predictor_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: neural_predictor_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: neural_predictor_nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+      - dashboard
+      - grafana
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+  # Jupyter Notebook for Development
+  jupyter:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jupyter
+    container_name: neural_predictor_jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=neural_predictor_token
+      - PYTHONPATH=/app
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./app:/app/app
+    ports:
+      - "8888:8888"
+    networks:
+      - predictor_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  model_cache:
+    driver: local
+  collector_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  predictor_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Development override
+# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+---
+# docker-compose.dev.yml
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    volumes:
+      - .:/app
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    volumes:
+      - .:/app
+    command: streamlit run dashboard/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+
+  data_collector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    volumes:
+      - .:/app
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+
+# Production override
+# Use: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+---
+# docker-compose.prod.yml
+version: '3.8'
+
+services:
+  api:
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  dashboard:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  data_collector:
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  postgres:
+    environment:
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+secrets:
+  postgres_password:
+    external: true
